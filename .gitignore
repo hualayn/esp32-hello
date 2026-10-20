@@ -1,0 +1,20 @@
+# 本地环境激活脚本（含本机绝对路径，不入库）
+idf_env.ps1
+
+# ESP-IDF 构建产物
+build/
+managed_components/
+dependencies.yaml
+
+# 自动生成的配置（提交 sdkconfig.defaults 即可）
+sdkconfig
+sdkconfig.old
+sdkconfig.*.autoconf
+
+# 编辑器 / 系统文件
+.vscode/
+.idea/
+__pycache__/
+*.pyc
+Thumbs.db
+desktop.ini
