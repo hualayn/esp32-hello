@@ -1,59 +1,59 @@
 /*
- * ESP32-S3 + 0.96" SSD1306 OLED：屏幕显示 Hello World，板载 LED 继续 1Hz 闪烁。
+ * ESP32-S3 + 0.96" SSD1306 OLED + WiFi AP (软热点) + Web 输入。
+ *
+ * - ESP32 作为 AP 广播 SSID esp32-test (WPA2, 密码 00000000)
+ * - 手机连上后打开 http://192.168.4.1，输入文字并提交
+ * - 提交的文字显示在 OLED 屏幕上
  *
  * OLED 接线: VCC=3V3, GND=GND, SCL=GPIO15, SDA=GPIO16 (I2C 地址 0x3C)
  */
 #include <stdio.h>
-#include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "driver/gpio.h"
 #include "esp_log.h"
 #include "oled_i2c.h"
+#include "wifi.h"
+#include "web.h"
 
-#define LED_GPIO  GPIO_NUM_4
+#define WIFI_SSID "esp32-test"
+#define WIFI_PASS "00000000"
 
 static const char *TAG = "app";
 
 void app_main(void)
 {
-    printf("\n=== ESP32-S3 + OLED Hello World ===\n");
-
-    /* 板载 LED (GPIO4) 1Hz 闪烁 */
-    gpio_set_direction(LED_GPIO, GPIO_MODE_OUTPUT);
+    printf("\n=== ESP32-S3 + OLED + WiFi AP + Web ===\n");
 
     /* 初始化 OLED */
     int rc = OLED_Init();
-    if (rc != 0) {
+    if (rc != 0)
+    {
         ESP_LOGE(TAG, "OLED init failed (code %d) - 请检查接线 (SCL=GPIO15, SDA=GPIO16, VCC, GND)", rc);
-        /* OLED 失败时仍保持 LED 闪烁，方便确认程序在运行 */
-        for (;;) {
-            gpio_set_level(LED_GPIO, 1);
-            vTaskDelay(pdMS_TO_TICKS(500));
-            gpio_set_level(LED_GPIO, 0);
-            vTaskDelay(pdMS_TO_TICKS(500));
+        for (;;)
+        {
+            vTaskDelay(pdMS_TO_TICKS(1000));
         }
     }
 
-    /* 清屏并显示 Hello World（水平居中，垂直居中）
-     * 12 个字符 x 6px = 72px 宽 -> x = (128-72)/2 = 28
-     * 8px 高 -> y = (64-8)/2 = 28 */
-    OLED_Clear();
-    const char *msg = "Hello World";
-    int16_t x = (int16_t)((OLED_WIDTH - (int16_t)strlen(msg) * 6) / 2);
-    int16_t y = (int16_t)((OLED_HEIGHT - 8) / 2);
-    OLED_ShowString(x, (uint8_t)y, msg);
-    OLED_Refresh();
-    ESP_LOGI(TAG, "OLED refresh done (fail code: 0x%04X)", (unsigned)oled_refresh_fail);
+    /* 启动 WiFi 热点 (AP 模式)，成功后手机/电脑可连接 esp32-test */
+    int wrc = wifi_ap_start(WIFI_SSID, WIFI_PASS);
+    if (wrc != 0)
+    {
+        ESP_LOGE(TAG, "WiFi AP start failed (code %d)", wrc);
+    }
 
-    /* 主循环：LED 闪烁 */
-    for (;;) {
-        gpio_set_level(LED_GPIO, 1);
-        printf("LED ON\n");
-        vTaskDelay(pdMS_TO_TICKS(500));
+    /* 初始显示：SSID + 网关地址，第三行等待 Web 输入 */
+    oled_show_text("");
 
-        gpio_set_level(LED_GPIO, 0);
-        printf("LED OFF\n");
-        vTaskDelay(pdMS_TO_TICKS(500));
+    /* 启动 Web 服务器：GET / 返回输入页，POST /submit 更新屏幕 */
+    if (web_server_start() != 0)
+    {
+        ESP_LOGE(TAG, "web server start failed");
+    }
+
+    /* 主循环：空闲，Web 回调负责显示更新 */
+    for (;;)
+    {
+        vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }

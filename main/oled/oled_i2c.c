@@ -17,6 +17,7 @@
   */
 #include "oled_i2c.h"
 #include "font6x8.h"
+#include "font16.h"
 
 #include <string.h>
 #include "freertos/FreeRTOS.h"
@@ -261,6 +262,53 @@ void OLED_ShowStringInv(int16_t x, uint8_t y, const char *s)
         x = (int16_t)(x + 6U);
         s++;
     }
+}
+
+int16_t OLED_ShowChar16(int16_t x, int16_t y, uint32_t cp)
+{
+    const uint8_t *bmp = font16_lookup(cp);
+    if (bmp == NULL)
+    {
+        return 8; /* not in the table: small skip */
+    }
+    for (int col = 0; col < 16; col++)
+    {
+        int16_t px = (int16_t)(x + col);
+        uint8_t lo = bmp[col * 2];
+        uint8_t hi = bmp[col * 2 + 1];
+        for (int b = 0; b < 8; b++)
+        {
+            if (lo & (1U << b))
+            {
+                OLED_DrawPixel(px, (int16_t)(y + b));
+            }
+            if (hi & (1U << b))
+            {
+                OLED_DrawPixel(px, (int16_t)(y + 8 + b));
+            }
+        }
+    }
+    return 16;
+}
+
+int16_t OLED_ShowString16(int16_t x, int16_t y, const char *utf8)
+{
+    const char *p = utf8;
+    while (*p != '\0')
+    {
+        uint32_t cp = font16_utf8_next(&p);
+        if (x + 16 > (int16_t)OLED_WIDTH)
+        {
+            x = 0;
+            y = (int16_t)(y + 16);
+        }
+        if (y + 16 > (int16_t)OLED_HEIGHT)
+        {
+            break; /* no more room on the screen */
+        }
+        x = (int16_t)(x + OLED_ShowChar16(x, y, cp));
+    }
+    return y;
 }
 
 void OLED_DrawPixel(int16_t x, int16_t y)

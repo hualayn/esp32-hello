@@ -62,6 +62,19 @@ void OLED_ShowString(int16_t x, uint8_t y, const char *s);
 void OLED_ShowStringInv(int16_t x, uint8_t y, const char *s);
 
 /**
+ * @brief Draw one Unicode code point with the 16x16 CJK font.
+ * @return advance width in px (16 = glyph drawn, 8 = not in the font table).
+ */
+int16_t OLED_ShowChar16(int16_t x, int16_t y, uint32_t cp);
+
+/**
+ * @brief Draw a UTF-8 string with the 16x16 CJK font (CJK + ASCII).
+ *        Wraps to the next 16px row when the screen edge is reached.
+ * @return the y of the last used row.
+ */
+int16_t OLED_ShowString16(int16_t x, int16_t y, const char *utf8);
+
+/**
  * @brief Set one frame-buffer pixel (off-screen coordinates are clipped).
  * @param x Column 0..127.
  * @param y Row 0..63 (pixel).
