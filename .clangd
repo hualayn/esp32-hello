@@ -1,6 +1,0 @@
-# 如果你用的是 clangd 扩展而不是微软 C/C++ 扩展：
-# - compile_commands.json 位于 build/ 下，clangd 会自动找到
-# - 忽略 references/ 目录（STM32 参考代码，不参与 ESP32 编译）
-Diagnostics:
-  IgnoredFiles:
-    - "references/.*"
