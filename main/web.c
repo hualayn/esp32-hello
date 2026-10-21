@@ -6,7 +6,7 @@
  *          POST /submit  -> takes the input and shows it on the OLED
  */
 #include "web.h"
-#include "oled_i2c.h"
+#include "u8g2_display.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -21,21 +21,61 @@ static httpd_handle_t s_server;
 #define AP_SSID "esp32-test"
 #define AP_URL  "http://192.168.4.1"
 
-/* ---------- OLED display ---------- */
+/* ---------- OLED display (u8g2) ---------- */
 
+/* 返回一个 UTF-8 字符占用的字节数（1..4） */
+static int utf8_char_len(uint8_t b)
+{
+    if (b < 0x80)            return 1;
+    if ((b & 0xE0) == 0xC0)  return 2;
+    if ((b & 0xF0) == 0xE0)  return 3;
+    if ((b & 0xF8) == 0xF0)  return 4;
+    return 1;
+}
+
+/*
+ * 屏幕布局（128x64）：
+ *   第 1 行  14: SSID            (6x12 字体)
+ *   第 2 行  28: 网关地址        (6x12 字体)
+ *   第 3/4 行 48/60: 用户输入    (wqy12 中文字库，UTF-8，满 128px 自动换行)
+ * 没有输入时显示"你好，世界！"
+ */
 void oled_show_text(const char *text)
 {
-    OLED_Clear();
-    /* line 1 (y=0): SSID, centered (10 chars x 6px = 60px -> x=34) */
-    OLED_ShowString(34, 0, AP_SSID);
-    /* line 2 (y=8): gateway URL, centered (18 chars x 6px = 108px -> x=10) */
-    OLED_ShowString(10, 8, AP_URL);
-    /* line 3+ (y=24): user input in 16x16 CJK font (8 chars/line, wraps) */
-    if (text != NULL && text[0] != '\0')
+    u8g2_t *d = oled_u8g2_get();
+    u8g2_ClearBuffer(d);
+
+    /* 前两行：热点信息（6x12 英文字体） */
+    u8g2_SetFont(d, u8g2_font_6x12_tn);
+    u8g2_DrawStr(d, 34, 14, AP_SSID);
+    u8g2_DrawStr(d, 10, 28, AP_URL);
+
+    /* 后两行：中文（wqy12 字库，直接喂 UTF-8 字符串） */
+    u8g2_SetFont(d, u8g2_font_wqy12_t_gb2312);
+    const char *s = (text != NULL && text[0] != '\0') ? text : "你好，世界！";
+    int x = 0, y = 48;
+    while (*s)
     {
-        OLED_ShowString16(0, 24, text);
+        int n = utf8_char_len((uint8_t)*s);
+        char one[5] = {0};
+        memcpy(one, s, n);
+        int w = u8g2_GetUTF8Width(d, one);   /* 该字符的宽度（CJK=12, 英文≈6） */
+        if (w <= 0) {                        /* 字库里没有的字，跳过 */
+            s += n;
+            continue;
+        }
+        if (x + w > 128) {                   /* 换行，最多两行 */
+            x = 0;
+            y += 12;
+            if (y > 60) {
+                break;
+            }
+        }
+        u8g2_DrawUTF8(d, x, y, one);
+        x += w;
+        s += n;
     }
-    OLED_Refresh();
+    u8g2_SendBuffer(d);
 }
 
 /* ---------- HTML pages (UTF-8) ---------- */
