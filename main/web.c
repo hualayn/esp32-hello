@@ -21,6 +21,9 @@ static httpd_handle_t s_server;
 #define AP_SSID "esp32-test"
 #define AP_URL  "http://192.168.4.1"
 
+/* wqy12 中文字形 12px 见方、步进也是 12px，字字紧贴；每个字符后加 1px 空隙更清晰 */
+#define CJK_CHAR_GAP 1
+
 /* ---------- OLED display (u8g2) ---------- */
 
 /* 返回一个 UTF-8 字符占用的字节数（1..4） */
@@ -45,8 +48,9 @@ void oled_show_text(const char *text)
     u8g2_t *d = oled_u8g2_get();
     u8g2_ClearBuffer(d);
 
-    /* 前两行：热点信息（6x12 英文字体） */
-    u8g2_SetFont(d, u8g2_font_6x12_tn);
+    /* 前两行：热点信息（6x12 英文字体；新版 u8g2 的完整 ASCII 版叫 6x12_tr，
+       6x12_tn 只有 18 个字形——空格+数字+少量标点，没有字母，不能用） */
+    u8g2_SetFont(d, u8g2_font_6x12_tr);
     u8g2_DrawStr(d, 34, 14, AP_SSID);
     u8g2_DrawStr(d, 10, 28, AP_URL);
 
@@ -64,7 +68,7 @@ void oled_show_text(const char *text)
             s += n;
             continue;
         }
-        if (x + w > 128) {                   /* 换行，最多两行 */
+        if (x + w + CJK_CHAR_GAP > 128) {  /* 换行（含间距），最多两行 */
             x = 0;
             y += 12;
             if (y > 60) {
@@ -72,7 +76,7 @@ void oled_show_text(const char *text)
             }
         }
         u8g2_DrawUTF8(d, x, y, one);
-        x += w;
+        x += w + CJK_CHAR_GAP;
         s += n;
     }
     u8g2_SendBuffer(d);
@@ -181,12 +185,23 @@ static esp_err_t index_get(httpd_req_t *req)
     return ESP_OK;
 }
 
+/*
+ * 注意：这些缓冲用 static 放在全局数据区，而不是 httpd 任务的栈上。
+ * httpd 任务默认栈只有 4KB，四个数组加起来 ~1.8KB，加上 httpd 自身帧和
+ * u8g2 渲染的开销，很容易把栈撑爆 → 任务崩溃 → 设备重启 → 手机掉线。
+ * httpd 的 handler 都跑在同一个任务里，串行执行，static 是安全的。
+ */
+static char s_body[384];
+static char s_text[128];
+static char s_escaped[512];
+static char s_page[768];
+
 static esp_err_t submit_post(httpd_req_t *req)
 {
     /* 1. read POST body */
-    char body[384];
+    char *body = s_body;
     size_t total = req->content_len;
-    if (total == 0 || total >= sizeof(body))
+    if (total == 0 || total >= sizeof(s_body))
     {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "empty body");
         return ESP_FAIL;
@@ -205,8 +220,8 @@ static esp_err_t submit_post(httpd_req_t *req)
     body[received] = '\0';
 
     /* 2. parse the "text" field */
-    char text[128];
-    if (form_get_text(body, text, sizeof(text)) != 0 || text[0] == '\0')
+    char *text = s_text;
+    if (form_get_text(body, text, sizeof(s_text)) != 0 || text[0] == '\0')
     {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing text");
         return ESP_FAIL;
@@ -217,10 +232,10 @@ static esp_err_t submit_post(httpd_req_t *req)
     oled_show_text(text);
 
     /* 4. respond with a tiny confirmation page */
-    char escaped[512];
-    html_escape(text, escaped, sizeof(escaped));
-    char page[768];
-    snprintf(page, sizeof(page), OK_HTML, escaped);
+    char *escaped = s_escaped;
+    html_escape(text, escaped, sizeof(s_escaped));
+    char *page = s_page;
+    snprintf(page, sizeof(s_page), OK_HTML, escaped);
     httpd_resp_set_type(req, "text/html; charset=utf-8");
     httpd_resp_send(req, page, HTTPD_RESP_USE_STRLEN);
     return ESP_OK;

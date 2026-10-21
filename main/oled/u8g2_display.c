@@ -106,9 +106,11 @@ esp_err_t oled_u8g2_init(void)
         return err;
     }
 
-    // 2. 配置 u8g2：SSD1306 128x64 + I2C，1 页缓冲（64 字节，全屏 8 页轮着发）
+    // 2. 配置 u8g2：SSD1306 128x64 + I2C，全屏缓冲（_f：1024 字节，一次发送整屏）
+    //    注意：1 页缓冲（_1）一次只发 8 行，其余行显示的是芯片里的旧数据，
+    //    多行布局必须用 _f 全屏缓冲
     //    U8G2_R0 = 屏幕方向 0 度（不旋转）
-    u8g2_Setup_ssd1306_i2c_128x64_noname_1(&u8g2, U8G2_R0, u8x8_byte_cb, u8x8_gpio_and_delay_cb);
+    u8g2_Setup_ssd1306_i2c_128x64_noname_f(&u8g2, U8G2_R0, u8x8_byte_cb, u8x8_gpio_and_delay_cb);
 
     // 3. 初始化显示芯片（u8g2 内部执行 SSD1306 初始化命令序列）
     u8g2_InitDisplay(&u8g2);
