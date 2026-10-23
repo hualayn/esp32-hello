@@ -29,9 +29,14 @@
 #define WIFI_SSID "esp32-test"
 #define WIFI_PASS "00000000"
 
-/* 热敏电阻温度模块：DO 接 GPIO5（高电平=超温报警），AO 接 GPIO4（本次不用） */
+/* 热敏电阻温度模块：DO 接 GPIO5，AO 接 GPIO4（本次不用） */
 #define PIN_TEMP_DO  GPIO_NUM_5
 #define PIN_LED      GPIO_NUM_48   /* 板载蓝色 LED（DevKitC-1：高电平点亮） */
+
+/* 比较器输出极性：本模块实测 "低电平 = 超温"（NTC 热敏电阻温度升高阻值下降，
+ * AO 分压随之下降，比较器在 AO < 参考电压时输出低电平）。
+ * 如果你的模块是"超温输出高电平"，把这里改成 0 即可。 */
+#define TEMP_DO_ACTIVE_LOW  1
 
 static const char *TAG = "app";
 
@@ -146,9 +151,10 @@ void app_main(void)
             last_level = level;
             same_count = 1;
         }
-        if (same_count >= 3 && alarm != (level != 0))
+        int hot = TEMP_DO_ACTIVE_LOW ? (level == 0) : (level != 0); /* 按极性换算"是否超温" */
+        if (same_count >= 3 && alarm != hot)
         {
-            alarm = (level != 0);
+            alarm = hot;
             gpio_set_level(PIN_LED, alarm ? 1 : 0);
             oled_show_text(alarm ? "超温！" : "正常");
             ESP_LOGI(TAG, "温度状态: %s", alarm ? "超温" : "正常");
