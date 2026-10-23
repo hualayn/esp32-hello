@@ -5,6 +5,7 @@
  * - 手机连上后打开 http://192.168.4.1，输入文字并提交
  * - 提交的文字（支持中文，u8g2 字库）显示在 OLED 屏幕上
  * - 串口控制台（ESP32-S3 原生 USB 口 = USB-Serial-JTAG）：输入 "oled <文字>" 回车，直接显示到屏幕
+ * - 热敏电阻温度模块 DO (GPIO5)：超温时点亮板载蓝 LED 并在 OLED 显示"超温！"
  *
  * 注意: IDF 5.5 的 esp_console 有个 bug —— linenoise 的 sanitize() 用 isprint()
  * 过滤命令行，而 C 语言 locale 下 isprint 只认 ASCII，会把 UTF-8 中文参数全部
@@ -12,6 +13,7 @@
  * components/console/linenoise/linenoise.c sanitize() 已打补丁保留 >=0x80 字节。
  *
  * OLED 接线: VCC=3V3, GND=GND, SCL=GPIO15, SDA=GPIO16 (I2C 地址 0x3C)
+ * 温度模块接线: DO=GPIO5, AO=GPIO4 (ADC, 本次未用), VCC=3V3, GND=GND
  */
 #include <stdio.h>
 #include <string.h>
@@ -19,12 +21,17 @@
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "esp_console.h"
+#include "driver/gpio.h"
 #include "u8g2_display.h"
 #include "wifi.h"
 #include "web.h"
 
 #define WIFI_SSID "esp32-test"
 #define WIFI_PASS "00000000"
+
+/* 热敏电阻温度模块：DO 接 GPIO5（高电平=超温报警），AO 接 GPIO4（本次不用） */
+#define PIN_TEMP_DO  GPIO_NUM_5
+#define PIN_LED      GPIO_NUM_48   /* 板载蓝色 LED（DevKitC-1：高电平点亮） */
 
 static const char *TAG = "app";
 
@@ -115,9 +122,37 @@ void app_main(void)
         ESP_LOGE(TAG, "console repl start failed");
     }
 
-    /* 主循环：空闲，Web 回调和串口命令负责显示更新 */
+    /* 主循环：轮询温度 DO（2Hz），状态变化（3 次连续相同采样去抖）才更新 LED 和 OLED。
+     * 模块比较器在阈值附近会抖动，不去抖的话 LED/OLED 会疯狂闪。
+     * 注意：oled_show_text 同时会被 httpd/REPL 任务调用，u8g2 非线程安全，
+     * 这里只在"状态变化"时才画，冲突窗口很小，学习项目可接受。 */
+    gpio_set_direction(PIN_TEMP_DO, GPIO_MODE_INPUT);
+    gpio_set_direction(PIN_LED, GPIO_MODE_OUTPUT);
+    gpio_set_level(PIN_LED, 0);
+
+    int last_level = gpio_get_level(PIN_TEMP_DO); /* 最近一次读到的电平 */
+    int same_count = 1;                           /* 连续相同电平的次数 */
+    bool alarm = false;                           /* 当前已显示的状态 */
+
     for (;;)
     {
-        vTaskDelay(pdMS_TO_TICKS(1000));
+        int level = gpio_get_level(PIN_TEMP_DO);
+        if (level == last_level)
+        {
+            same_count++;
+        }
+        else
+        {
+            last_level = level;
+            same_count = 1;
+        }
+        if (same_count >= 3 && alarm != (level != 0))
+        {
+            alarm = (level != 0);
+            gpio_set_level(PIN_LED, alarm ? 1 : 0);
+            oled_show_text(alarm ? "超温！" : "正常");
+            ESP_LOGI(TAG, "温度状态: %s", alarm ? "超温" : "正常");
+        }
+        vTaskDelay(pdMS_TO_TICKS(500)); /* 2Hz */
     }
 }
