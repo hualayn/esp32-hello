@@ -10,6 +10,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdbool.h>
 #include <string.h>
 #include "esp_http_server.h"
 #include "esp_log.h"
@@ -79,6 +80,42 @@ void oled_show_text(const char *text)
         x += w + CJK_CHAR_GAP;
         s += n;
     }
+    u8g2_SendBuffer(d);
+}
+
+/*
+ * 温度监控画面布局（128x64）：
+ *   第 1 行  14: 状态（低温/正常/超温），wqy12 中文，居中
+ *   第 2 行  36: 温度数值 "25.3 C"，6x18 大字，居中
+ *   第 3 行  60: 小提示文字（如 "AO=GPIO4"）
+ */
+void oled_show_temp_status(const char *status, float temp_c, bool is_valid)
+{
+    u8g2_t *d = oled_u8g2_get();
+    u8g2_ClearBuffer(d);
+
+    /* 第一行：状态（wqy12 中文，12px 字高） */
+    u8g2_SetFont(d, u8g2_font_wqy12_t_gb2312);
+    int sw = u8g2_GetUTF8Width(d, status);
+    u8g2_DrawUTF8(d, (128 - sw) / 2, 14, status);
+
+    /* 第二行：温度数值（6x18 数字字体，居中） */
+    char buf[24];
+    if (is_valid) {
+        snprintf(buf, sizeof(buf), "%.1f C", (double)temp_c);
+    } else {
+        snprintf(buf, sizeof(buf), "---- C");
+    }
+    u8g2_SetFont(d, u8g2_font_logisoso16_tf);
+    int tw = u8g2_GetStrWidth(d, buf);
+    u8g2_DrawStr(d, (128 - tw) / 2, 38, buf);
+
+    /* 第三行：小提示（6x12 字体，居中） */
+    u8g2_SetFont(d, u8g2_font_6x12_tr);
+    const char *hint = "AO=GPIO4";
+    int hw = u8g2_GetStrWidth(d, hint);
+    u8g2_DrawStr(d, (128 - hw) / 2, 58, hint);
+
     u8g2_SendBuffer(d);
 }
 

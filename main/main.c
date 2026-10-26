@@ -5,7 +5,10 @@
  * - 手机连上后打开 http://192.168.4.1，输入文字并提交
  * - 提交的文字（支持中文，u8g2 字库）显示在 OLED 屏幕上
  * - 串口控制台（ESP32-S3 原生 USB 口 = USB-Serial-JTAG）：输入 "oled <文字>" 回车，直接显示到屏幕
- * - 热敏电阻温度模块 DO (GPIO5)：超温时点亮板载蓝 LED 并在 OLED 显示"超温！"
+ * - 热敏电阻温度模块三档状态（完全由 AO ADC 温度决定，DO 仅日志参考）：
+ *   - temp_c ≥ 35°C        → 超温（LED 常亮 + OLED 显示"超温"）
+ *   - 25°C ≤ temp_c < 35°C → 正常（LED 熄灭 + OLED 显示"正常"）
+ *   - temp_c < 25°C        → 低温（LED 闪烁 + OLED 显示"低温"）
  *
  * 注意: IDF 5.5 的 esp_console 有个 bug —— linenoise 的 sanitize() 用 isprint()
  * 过滤命令行，而 C 语言 locale 下 isprint 只认 ASCII，会把 UTF-8 中文参数全部
@@ -13,15 +16,17 @@
  * components/console/linenoise/linenoise.c sanitize() 已打补丁保留 >=0x80 字节。
  *
  * OLED 接线: VCC=3V3, GND=GND, SCL=GPIO15, SDA=GPIO16 (I2C 地址 0x3C)
- * 温度模块接线: DO=GPIO5, AO=GPIO4 (ADC, 本次未用), VCC=3V3, GND=GND
+ * 温度模块接线: DO=GPIO5, AO=GPIO4 (ADC), VCC=3V3, GND=GND
  */
 #include <stdio.h>
 #include <string.h>
+#include <math.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "esp_console.h"
 #include "driver/gpio.h"
+#include "esp_adc/adc_oneshot.h"
 #include "u8g2_display.h"
 #include "wifi.h"
 #include "web.h"
@@ -29,14 +34,33 @@
 #define WIFI_SSID "esp32-test"
 #define WIFI_PASS "00000000"
 
-/* 热敏电阻温度模块：DO 接 GPIO5，AO 接 GPIO4（本次不用） */
+/* 热敏电阻温度模块：DO 接 GPIO5，AO 接 GPIO4（ADC 采样） */
 #define PIN_TEMP_DO  GPIO_NUM_5
 #define PIN_LED      GPIO_NUM_48   /* 板载蓝色 LED（DevKitC-1：高电平点亮） */
 
+/* AO 引脚（ADC） */
+#define PIN_TEMP_AO  GPIO_NUM_4
+#define ADC_UNIT     ADC_UNIT_1
+#define ADC_CHANNEL  ADC_CHANNEL_3   /* GPIO4 = ADC1_CH3 */
+#define ADC_ATTEN    ADC_ATTEN_DB_12 /* 0~3.3V 满量程 */
+
 /* 比较器输出极性：本模块实测 "低电平 = 超温"（NTC 热敏电阻温度升高阻值下降，
  * AO 分压随之下降，比较器在 AO < 参考电压时输出低电平）。
- * 如果你的模块是"超温输出高电平"，把这里改成 0 即可。 */
-#define TEMP_DO_ACTIVE_LOW  1
+ * 如果你的模块是"超温输出高电平"，把这里改成 0 即可。
+ * 注意：当前三档判定完全基于 AO 温度，DO 电平仅用于日志参考。 */
+
+/* NTC 热敏电阻标定曲线：
+ * 模块型号不同曲线略有差异，这里用典型 B 值公式近似：
+ *   R(T) = R25 * exp(B * (1/T - 1/T25))
+ * 分压公式（AO 端）：Vout = Vcc * Rntc / (Rfixed + Rntc)
+ * Vcc = 3.3V，Rfixed = 10kΩ（典型值）。
+ * 用 AO 采样电压反算 NTC 阻值，再反算温度（开尔文）。
+ */
+#define NTC_R25    10000.0f  /* 25°C 标称阻值 10k */
+#define NTC_BETA   3950.0f   /* B 值（典型 NTC） */
+#define NTC_RFIXED 10000.0f  /* 分压固定电阻 */
+#define NTC_VCC    3.3f      /* 模块供电电压 */
+#define NTC_T25_K  298.15f   /* 25°C = 298.15K */
 
 static const char *TAG = "app";
 
@@ -77,8 +101,53 @@ static const esp_console_cmd_t s_commands[] = {
         .help = "OLED 显示文字: oled <文字>\n例: oled 测试",
         .func = &cmd_oled,
     },
-    { 0, 0, 0, 0 },  /* 结束标记 */
+    { 0 },  /* 结束标记 */
 };
+
+/* ---------- ADC 初始化（AO 引脚） ---------- */
+static adc_oneshot_unit_handle_t adc1_handle;
+
+static void temp_adc_init(void)
+{
+    adc_oneshot_unit_init_cfg_t unit_cfg = { .unit_id = ADC_UNIT };
+    ESP_ERROR_CHECK(adc_oneshot_new_unit(&unit_cfg, &adc1_handle));
+
+    adc_oneshot_chan_cfg_t chan_cfg = {
+        .atten = ADC_ATTEN,
+        .bitwidth = ADC_BITWIDTH_DEFAULT,
+    };
+    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc1_handle, ADC_CHANNEL, &chan_cfg));
+}
+
+/* 读 AO 原始 ADC 值，返回摄氏温度；失败返回 NAN */
+static float temp_read_celsius(void)
+{
+    int raw = 0;
+    if (adc_oneshot_read(adc1_handle, ADC_CHANNEL, &raw) != ESP_OK)
+    {
+        return NAN;
+    }
+    /* ADC → 电压（ESP32-S3 12bit, 0~4095 → 0~3.3V） */
+    float vout = (raw / 4095.0f) * NTC_VCC;
+
+    /* 反算 NTC 阻值：Vout = Vcc * Rntc / (Rfixed + Rntc) → Rntc = Rfixed * Vout / (Vcc - Vout) */
+    if (vout >= NTC_VCC - 0.01f || vout <= 0.01f)
+    {
+        return NAN;  /* 分压异常（开路/短路） */
+    }
+    float rntc = NTC_RFIXED * vout / (NTC_VCC - vout);
+
+    /* NTC B 值公式反算温度：T = 1 / (1/T25 + ln(R/R25)/B) */
+    float t_k = 1.0f / (1.0f / NTC_T25_K + logf(rntc / NTC_R25) / NTC_BETA);
+    return t_k - 273.15f;  /* 开尔文 → 摄氏 */
+}
+
+/* 三档状态 */
+typedef enum {
+    TEMP_STATE_LOW,      /* 低温（冰触碰） */
+    TEMP_STATE_NORMAL,   /* 常温 */
+    TEMP_STATE_OVER,     /* 超温报警 */
+} temp_state_t;
 
 void app_main(void)
 {
@@ -127,38 +196,88 @@ void app_main(void)
         ESP_LOGE(TAG, "console repl start failed");
     }
 
-    /* 主循环：轮询温度 DO（2Hz），状态变化（3 次连续相同采样去抖）才更新 LED 和 OLED。
-     * 模块比较器在阈值附近会抖动，不去抖的话 LED/OLED 会疯狂闪。
-     * 注意：oled_show_text 同时会被 httpd/REPL 任务调用，u8g2 非线程安全，
-     * 这里只在"状态变化"时才画，冲突窗口很小，学习项目可接受。 */
+    /* ---------- 温度监控主循环 ---------- */
     gpio_set_direction(PIN_TEMP_DO, GPIO_MODE_INPUT);
     gpio_set_direction(PIN_LED, GPIO_MODE_OUTPUT);
     gpio_set_level(PIN_LED, 0);
 
-    int last_level = gpio_get_level(PIN_TEMP_DO); /* 最近一次读到的电平 */
-    int same_count = 1;                           /* 连续相同电平的次数 */
-    bool alarm = false;                           /* 当前已显示的状态 */
+    temp_adc_init();  /* 初始化 AO 引脚 ADC */
+
+    int last_level = gpio_get_level(PIN_TEMP_DO);
+    int same_count = 1;
+    temp_state_t state = TEMP_STATE_NORMAL;   /* 当前档位 */
+    TickType_t last_tick = xTaskGetTickCount();
+    TickType_t last_refresh = xTaskGetTickCount();
 
     for (;;)
     {
         int level = gpio_get_level(PIN_TEMP_DO);
-        if (level == last_level)
+
+        /* DO 去抖：连续 3 次采样一致才认定变化（仅用于日志） */
+        if (level == last_level) { same_count++; }
+        else { last_level = level; same_count = 1; }
+
+        /* 读 AO → 温度值 */
+        float temp_c = temp_read_celsius();
+        bool valid = !isnan(temp_c);
+
+        /*
+         * 三档判定：仅根据 AO 换算出的温度 temp_c。
+         *   temp_c ≥ 35°C         → 超温
+         *   25°C ≤ temp_c < 35°C  → 正常
+         *   temp_c < 25°C         → 低温
+         * 若 ADC 读数不可靠（NAN），保持上一次状态。
+         */
+        temp_state_t new_state = state; /* 默认保持不变 */
+        if (valid)
         {
-            same_count++;
+            if (temp_c >= 35.0f)        new_state = TEMP_STATE_OVER;
+            else if (temp_c >= 25.0f)   new_state = TEMP_STATE_NORMAL;
+            else                         new_state = TEMP_STATE_LOW;
+        }
+
+        /* 去抖后应用新状态 */
+        if (same_count >= 3 && state != new_state)
+        {
+            state = new_state;
+            const char *txt = (state == TEMP_STATE_OVER)  ? "超温"
+                            : (state == TEMP_STATE_LOW)   ? "低温"
+                            : "正常";
+            ESP_LOGI(TAG, "状态变化 → %s (temp=%.1f°C)",
+                     txt, (double)temp_c);
+        }
+
+        /* 每 1 秒刷新一次 OLED 显示（温度数值持续变化） */
+        TickType_t now = xTaskGetTickCount();
+        if ((now - last_refresh) >= pdMS_TO_TICKS(1000))
+        {
+            last_refresh = now;
+            const char *txt = (state == TEMP_STATE_OVER)  ? "超温"
+                            : (state == TEMP_STATE_LOW)   ? "低温"
+                            : "正常";
+            oled_show_temp_status(txt, temp_c, valid);
+        }
+
+        /* LED 模式：
+         *   超温 → 常亮
+         *   低温 → 闪烁（500ms 周期）
+         *   正常 → 熄灭
+         */
+        if (state == TEMP_STATE_OVER)
+        {
+            gpio_set_level(PIN_LED, 1);
+        }
+        else if (state == TEMP_STATE_LOW)
+        {
+            int blink = ((now - last_tick) / pdMS_TO_TICKS(250)) % 2;
+            gpio_set_level(PIN_LED, blink);
         }
         else
         {
-            last_level = level;
-            same_count = 1;
+            gpio_set_level(PIN_LED, 0);
+            last_tick = now;  /* 重置闪烁计时 */
         }
-        int hot = TEMP_DO_ACTIVE_LOW ? (level == 0) : (level != 0); /* 按极性换算"是否超温" */
-        if (same_count >= 3 && alarm != hot)
-        {
-            alarm = hot;
-            gpio_set_level(PIN_LED, alarm ? 1 : 0);
-            oled_show_text(alarm ? "超温！" : "正常");
-            ESP_LOGI(TAG, "温度状态: %s", alarm ? "超温" : "正常");
-        }
-        vTaskDelay(pdMS_TO_TICKS(500)); /* 2Hz */
+
+        vTaskDelay(pdMS_TO_TICKS(250));  /* 4Hz 采样 */
     }
 }
