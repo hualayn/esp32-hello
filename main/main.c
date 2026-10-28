@@ -9,6 +9,8 @@
  *   - temp_c ≥ 35°C        → 超温（LED 常亮 + OLED 显示"超温"）
  *   - 25°C ≤ temp_c < 35°C → 正常（LED 熄灭 + OLED 显示"正常"）
  *   - temp_c < 25°C        → 低温（LED 闪烁 + OLED 显示"低温"）
+ * - 外接按键 ×2：GPIO10 / GPIO12（各一脚接对应引脚、一脚接 GND，内部上拉，按下=低电平）：
+ *   任一按下 → 翻转板载 LED（正常温度档下生效）+ OLED 显示"按钮10按下啦！"/"按钮12按下啦！"3 秒
  *
  * 注意: IDF 5.5 的 esp_console 有个 bug —— linenoise 的 sanitize() 用 isprint()
  * 过滤命令行，而 C 语言 locale 下 isprint 只认 ASCII，会把 UTF-8 中文参数全部
@@ -17,6 +19,7 @@
  *
  * OLED 接线: VCC=3V3, GND=GND, SCL=GPIO15, SDA=GPIO16 (I2C 地址 0x3C)
  * 温度模块接线: DO=GPIO5, AO=GPIO4 (ADC), VCC=3V3, GND=GND
+ * 按键接线: 按键1 一脚=GPIO10，按键2 一脚=GPIO12，另一脚均接 GND（内部上拉，无需外部电阻）
  */
 #include <stdio.h>
 #include <string.h>
@@ -37,6 +40,9 @@
 /* 热敏电阻温度模块：DO 接 GPIO5，AO 接 GPIO4（ADC 采样） */
 #define PIN_TEMP_DO  GPIO_NUM_5
 #define PIN_LED      GPIO_NUM_48   /* 板载蓝色 LED（DevKitC-1：高电平点亮） */
+#define PIN_BTN1     GPIO_NUM_10   /* 外接按键1：一脚接 GPIO10、一脚接 GND（内部上拉，按下为低电平） */
+#define PIN_BTN2     GPIO_NUM_12   /* 外接按键2：一脚接 GPIO12、一脚接 GND（内部上拉，按下为低电平） */
+#define BTN_PRESS_MS 3000          /* 按下后 OLED 提示保持时长 */
 
 /* AO 引脚（ADC） */
 #define PIN_TEMP_AO  GPIO_NUM_4
@@ -149,6 +155,32 @@ typedef enum {
     TEMP_STATE_OVER,     /* 超温报警 */
 } temp_state_t;
 
+/* ---------- 按键（外接，250ms 轮询 + 连续 3 次一致去抖 ≈ 750ms） ---------- */
+typedef struct {
+    gpio_num_t pin;
+    int last_level;
+    int cnt;
+    int latched;   /* 按下锁存：一次按压只触发一次 */
+} btn_state_t;
+
+/* 更新一个按键的去抖状态；按下(低)确认的当刻返回 1，松开(高)确认后解锁 */
+static int btn_update(btn_state_t *b)
+{
+    int lvl = gpio_get_level(b->pin);
+    if (lvl == b->last_level) { b->cnt++; }
+    else { b->last_level = lvl; b->cnt = 1; }
+    if (lvl == 0 && b->cnt == 3 && !b->latched)
+    {
+        b->latched = 1;
+        return 1;
+    }
+    if (lvl == 1 && b->cnt == 3)
+    {
+        b->latched = 0;
+    }
+    return 0;
+}
+
 void app_main(void)
 {
     printf("\n=== ESP32-S3 + OLED (u8g2) + WiFi AP + Web ===\n");
@@ -201,6 +233,16 @@ void app_main(void)
     gpio_set_direction(PIN_LED, GPIO_MODE_OUTPUT);
     gpio_set_level(PIN_LED, 0);
 
+    /* 外接按键：输入 + 内部上拉，按下 = 低电平 */
+    gpio_config_t btn_cfg = {
+        .pin_bit_mask = (1ULL << PIN_BTN1) | (1ULL << PIN_BTN2),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    ESP_ERROR_CHECK(gpio_config(&btn_cfg));
+
     temp_adc_init();  /* 初始化 AO 引脚 ADC */
 
     int last_level = gpio_get_level(PIN_TEMP_DO);
@@ -209,6 +251,13 @@ void app_main(void)
     TickType_t last_tick = xTaskGetTickCount();
     TickType_t last_refresh = xTaskGetTickCount();
 
+    /* 按键状态（250ms 轮询 + 连续 3 次一致去抖 ≈ 750ms） */
+    btn_state_t btn1 = { .pin = PIN_BTN1, .last_level = gpio_get_level(PIN_BTN1), .cnt = 1, .latched = 0 };
+    btn_state_t btn2 = { .pin = PIN_BTN2, .last_level = gpio_get_level(PIN_BTN2), .cnt = 1, .latched = 0 };
+    int led_user = 0;             /* 按钮翻转的 LED 状态（正常温度档下生效） */
+    TickType_t btn_show_until = 0;/* OLED 显示按钮提示的截止时间 */
+    char btn_msg[32] = "";        /* OLED 按钮提示文字（UTF-8，"按钮12按下啦！"=20 字节+结束符） */
+
     for (;;)
     {
         int level = gpio_get_level(PIN_TEMP_DO);
@@ -216,6 +265,19 @@ void app_main(void)
         /* DO 去抖：连续 3 次采样一致才认定变化（仅用于日志） */
         if (level == last_level) { same_count++; }
         else { last_level = level; same_count = 1; }
+
+        /* 按键1/2：去抖 + 锁存，一次按压只触发一次 */
+        int pin_pressed = 0;
+        if (btn_update(&btn1))      pin_pressed = PIN_BTN1;
+        else if (btn_update(&btn2)) pin_pressed = PIN_BTN2;
+        if (pin_pressed)
+        {
+            led_user = !led_user;
+            gpio_set_level(PIN_LED, led_user);  /* 超温/低温档下会被报警逻辑覆盖，属正常 */
+            btn_show_until = xTaskGetTickCount() + pdMS_TO_TICKS(BTN_PRESS_MS);
+            snprintf(btn_msg, sizeof(btn_msg), "按钮%d按下啦！", pin_pressed);
+            ESP_LOGI(TAG, "按钮%d按下 → LED=%d", pin_pressed, led_user);
+        }
 
         /* 读 AO → 温度值 */
         float temp_c = temp_read_celsius();
@@ -252,16 +314,24 @@ void app_main(void)
         if ((now - last_refresh) >= pdMS_TO_TICKS(1000))
         {
             last_refresh = now;
-            const char *txt = (state == TEMP_STATE_OVER)  ? "超温"
-                            : (state == TEMP_STATE_LOW)   ? "低温"
-                            : "正常";
-            oled_show_temp_status(txt, temp_c, valid);
+            if (now < btn_show_until)
+            {
+                /* 按钮提示窗口内：显示是哪个按钮（顶部仍保留 SSID/地址） */
+                oled_show_text(btn_msg);
+            }
+            else
+            {
+                const char *txt = (state == TEMP_STATE_OVER)  ? "超温"
+                                : (state == TEMP_STATE_LOW)   ? "低温"
+                                : "正常";
+                oled_show_temp_status(txt, temp_c, valid);
+            }
         }
 
         /* LED 模式：
          *   超温 → 常亮
          *   低温 → 闪烁（500ms 周期）
-         *   正常 → 熄灭
+         *   正常 → 跟随按钮翻转的状态（led_user）
          */
         if (state == TEMP_STATE_OVER)
         {
@@ -274,7 +344,7 @@ void app_main(void)
         }
         else
         {
-            gpio_set_level(PIN_LED, 0);
+            gpio_set_level(PIN_LED, led_user);
             last_tick = now;  /* 重置闪烁计时 */
         }
 

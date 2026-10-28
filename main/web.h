@@ -8,6 +8,8 @@
 #ifndef WEB_H
 #define WEB_H
 
+#include <stdbool.h>
+
 /**
  * @brief Start the HTTP server on the AP interface (port 80).
  *        GET  /        -> page with a text input + submit button
